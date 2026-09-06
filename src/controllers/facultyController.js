@@ -8,16 +8,19 @@ const { getLabProgress } = require('../services/progressService');
 
 /**
  * GET /api/faculty/students
- * Filter by class, section, academicYear
+ * Filter by class, section, academicYear, registrationNumber
  */
 const getStudentsByFilter = async (req, res, next) => {
   try {
-    const { class: className, section, academicYear } = req.query;
+    const { class: className, section, academicYear, registrationNumber } = req.query;
 
     const filter = { role: 'student' };
     if (className) filter.class = className;
     if (section) filter.section = section;
     if (academicYear) filter.academicYear = academicYear;
+    if (registrationNumber) {
+      filter.registrationNumber = { $regex: registrationNumber, $options: 'i' };
+    }
 
     const students = await User.find(filter)
       .select('name email registrationNumber class section academicYear mobileNumber profileCompleted')
@@ -94,10 +97,14 @@ const getStudentProgress = async (req, res, next) => {
               isActive: true,
             });
 
+            // NOTE: .populate('problem', 'title questionNumber marks') added so
+            // each submission carries its question number/title for display and
+            // so the frontend can link directly to the correct per-question
+            // Submission._id instead of the experiment-level ExperimentSubmission._id.
             const studentSubmissions = await Submission.find({
               weeklyExperiment: exp._id,
               student: studentId,
-            });
+            }).populate('problem', 'title questionNumber marks');
 
             const finalSubmission = await ExperimentSubmission.findOne({
               weeklyExperiment: exp._id,
