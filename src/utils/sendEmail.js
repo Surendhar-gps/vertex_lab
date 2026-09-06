@@ -1,5 +1,12 @@
 const nodemailer = require('nodemailer');
 
+/**
+ * Sends an email via Gmail SMTP using nodemailer.
+ *
+ * Required env vars:
+ *   EMAIL_USER - the sending Gmail address
+ *   EMAIL_PASS - a Gmail App Password (not your normal password)
+ */
 const sendEmail = async ({ to, subject, html, text }) => {
   console.log('[sendEmail] EMAIL_USER set:', !!process.env.EMAIL_USER);
   console.log('[sendEmail] EMAIL_PASS set:', !!process.env.EMAIL_PASS);
@@ -16,7 +23,6 @@ const sendEmail = async ({ to, subject, html, text }) => {
       user: process.env.EMAIL_USER,
       pass: process.env.EMAIL_PASS,
     },
-    family: 4, // force IPv4
   });
 
   try {
