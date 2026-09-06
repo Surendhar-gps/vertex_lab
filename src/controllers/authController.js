@@ -410,7 +410,7 @@ const forgotPassword = async (req, res, next) => {
     user.resetPasswordExpires = Date.now() + 30 * 60 * 1000; // 30 minutes
     await user.save({ validateBeforeSave: false });
 
-    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+    const frontendUrl = process.env.CLIENT_URL || 'http://localhost:5173';
     // Token is a URL path param (matches the frontend route /reset-password/:token
     // and authService.resetPassword, which POSTs to /auth/reset-password/:token).
     // Role is appended only as an optional query hint, not read by the backend.
