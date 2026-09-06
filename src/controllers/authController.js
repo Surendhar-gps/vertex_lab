@@ -1,6 +1,8 @@
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const mongoose = require('mongoose');
 const User = require('../models/User');
+const sendEmail = require('../utils/sendEmail');
 
 /**
  * Generate JWT token
@@ -362,4 +364,151 @@ const updateProfile = async (req, res, next) => {
   }
 };
 
-module.exports = { register, login, studentSelfRegister, getMe, profileSetup, updateProfile };
+/**
+ * POST /api/auth/forgot-password
+ * Body: { email, role }
+ *
+ * Always responds with a generic success message, whether or not an account
+ * exists for that email — this prevents someone from using this endpoint to
+ * discover which emails are registered. If a matching, active account is
+ * found, a reset token is generated, hashed, stored with a 30-minute expiry,
+ * and a reset link is emailed to the address on file.
+ */
+const forgotPassword = async (req, res, next) => {
+  const genericResponse = {
+    success: true,
+    message: 'If an account exists for this email, a password reset link has been sent.',
+  };
+
+  try {
+    const { email, role } = req.body;
+
+    if (!email) {
+      return res.status(400).json({
+        success: false,
+        message: 'Email is required.',
+      });
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+    const query = { email: normalizedEmail };
+    if (role) query.role = role;
+
+    const user = await User.findOne(query);
+
+    // Don't reveal whether the account exists — respond the same either way.
+    if (!user || !user.isActive) {
+      return res.json(genericResponse);
+    }
+
+    // Generate a random raw token; only the SHA-256 hash of it is stored.
+    // The raw token goes out in the email and is never persisted anywhere.
+    const rawToken = crypto.randomBytes(32).toString('hex');
+    const hashedToken = crypto.createHash('sha256').update(rawToken).digest('hex');
+
+    user.resetPasswordToken = hashedToken;
+    user.resetPasswordExpires = Date.now() + 30 * 60 * 1000; // 30 minutes
+    await user.save({ validateBeforeSave: false });
+
+    const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:5173';
+    // Token is a URL path param (matches the frontend route /reset-password/:token
+    // and authService.resetPassword, which POSTs to /auth/reset-password/:token).
+    // Role is appended only as an optional query hint, not read by the backend.
+    const resetLink = `${frontendUrl}/reset-password/${rawToken}${user.role ? `?role=${user.role}` : ''}`;
+
+    try {
+      await sendEmail({
+        to: user.email,
+        subject: 'Reset your Vertex Lab password',
+        html: `
+          <p>Hi ${user.name || ''},</p>
+          <p>We received a request to reset your password. Click the link below to choose a new one:</p>
+          <p><a href="${resetLink}">${resetLink}</a></p>
+          <p>This link expires in 30 minutes. If you didn't request this, you can safely ignore this email.</p>
+        `,
+        text: `Reset your password: ${resetLink} (expires in 30 minutes)`,
+      });
+    } catch (emailError) {
+      // Roll back the token so a broken mailer doesn't leave a dangling,
+      // unusable reset request on the account.
+      user.resetPasswordToken = undefined;
+      user.resetPasswordExpires = undefined;
+      await user.save({ validateBeforeSave: false });
+      console.error('[forgotPassword] Failed to send email:', emailError.message);
+      return res.status(500).json({
+        success: false,
+        message: 'Unable to send the reset email right now. Please try again later.',
+      });
+    }
+
+    return res.json(genericResponse);
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * POST /api/auth/reset-password/:token
+ * Params: { token }
+ * Body: { password }
+ *
+ * Verifies the token against the stored hash and expiry, then sets the new
+ * password (hashed automatically by the User model's pre-save hook).
+ */
+const resetPassword = async (req, res, next) => {
+  try {
+    const { token } = req.params;
+    const { password } = req.body;
+
+    if (!token || !password) {
+      return res.status(400).json({
+        success: false,
+        message: 'Token and new password are required.',
+      });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({
+        success: false,
+        message: 'Password must be at least 6 characters.',
+      });
+    }
+
+    const hashedToken = crypto.createHash('sha256').update(token).digest('hex');
+
+    const user = await User.findOne({
+      resetPasswordToken: hashedToken,
+      resetPasswordExpires: { $gt: Date.now() },
+    }).select('+resetPasswordToken +resetPasswordExpires');
+
+    if (!user) {
+      return res.status(400).json({
+        success: false,
+        message: 'This reset link is invalid or has expired. Please request a new one.',
+      });
+    }
+
+    user.password = password; // pre-save hook hashes this
+    user.resetPasswordToken = undefined;
+    user.resetPasswordExpires = undefined;
+    await user.save();
+
+    res.json({
+      success: true,
+      message: 'Password has been reset successfully. You can now sign in.',
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+module.exports = {
+  register,
+  login,
+  studentSelfRegister,
+  getMe,
+  profileSetup,
+  updateProfile,
+  forgotPassword,
+  resetPassword,
+};

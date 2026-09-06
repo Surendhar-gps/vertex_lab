@@ -1,5 +1,7 @@
 const mongoose = require('mongoose');
 
+const YEAR_LEVELS = ['I', 'II', 'III', 'IV'];
+
 const classSectionSchema = new mongoose.Schema(
   {
     department: {
@@ -16,8 +18,13 @@ const classSectionSchema = new mongoose.Schema(
     },
     academicYear: {
       type: String,
-      required: [true, 'Academic year is required'],
+      required: [true, 'Year level is required'],
       trim: true,
+      uppercase: true,
+      enum: {
+        values: YEAR_LEVELS,
+        message: 'Year level must be one of I, II, III, IV',
+      },
     },
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
@@ -34,5 +41,7 @@ classSectionSchema.index(
   { department: 1, section: 1, academicYear: 1 },
   { unique: true }
 );
+
+classSectionSchema.statics.YEAR_LEVELS = YEAR_LEVELS;
 
 module.exports = mongoose.model('ClassSection', classSectionSchema);

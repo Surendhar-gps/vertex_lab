@@ -1,6 +1,9 @@
 require('dotenv').config();
+console.log('EMAIL_USER loaded:', process.env.EMAIL_USER);
+console.log('EMAIL_PASS loaded:', process.env.EMAIL_PASS ? 'yes (hidden)' : 'undefined');
 const app = require('./app');
 const connectDB = require('./config/db');
+
 
 const PORT = process.env.PORT || 5000;
 
