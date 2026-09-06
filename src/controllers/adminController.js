@@ -88,7 +88,7 @@ const getUsers = async (req, res, next) => {
  */
 const createUser = async (req, res, next) => {
   try {
-    const { name, email, password, role } = req.body;
+    const { name, email, password, role, class: userClass } = req.body;
 
     if (!email || !password || !role) {
       return res.status(400).json({
@@ -105,7 +105,13 @@ const createUser = async (req, res, next) => {
       });
     }
 
-    const user = await User.create({ name, email, password, role });
+    const user = await User.create({
+      name,
+      email,
+      password,
+      role,
+      class: userClass ? userClass.toUpperCase() : undefined,
+    });
     res.status(201).json({
       success: true,
       message: 'User created successfully.',
