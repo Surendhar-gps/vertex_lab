@@ -395,6 +395,38 @@ const parseFile = (file) => {
   return data;
 };
 
+/**
+ * Reads a column's value off a parsed CSV/Excel row, tolerant of the exact
+ * header text changing over time (it went from "Year" to "Academic Year" to
+ * "Year of Study (I/II/III/IV)" as the UI evolved). Tries an ordered list of
+ * exact header names first, then falls back to any column whose header
+ * contains the given substring (case-insensitive), so old and new template
+ * downloads both keep working.
+ */
+const readColumn = (row, exactNames, fallbackSubstring) => {
+  for (const name of exactNames) {
+    const val = row[name];
+    if (val !== undefined && val !== null && val.toString().trim() !== '') {
+      return val.toString().trim();
+    }
+  }
+  if (fallbackSubstring) {
+    const key = Object.keys(row).find(
+      (k) => k.toLowerCase().includes(fallbackSubstring.toLowerCase())
+    );
+    if (key && row[key] !== undefined && row[key] !== null) {
+      return row[key].toString().trim();
+    }
+  }
+  return '';
+};
+
+const readYearColumn = (row) => readColumn(
+  row,
+  ['Year of Study (I/II/III/IV)', 'Year of Study', 'Academic Year', 'academicYear', 'Year', 'year'],
+  'year'
+);
+
 const getDepartments = async (req, res, next) => {
   try {
     const departments = await Department.find().sort({ name: 1 });
@@ -434,7 +466,7 @@ const parseDepts = async (req, res, next) => {
     for (const row of data) {
       let dName = (row['Department'] || row['department'] || '').toString().trim().toUpperCase();
       let sec = (row['Section'] || row['section'] || '').toString().trim().toUpperCase();
-      let year = (row['Academic Year'] || row['academicYear'] || row['Year'] || '').toString().trim();
+      let year = readYearColumn(row);
 
       if (!dName) continue;
 
@@ -446,11 +478,15 @@ const parseDepts = async (req, res, next) => {
         };
       }
 
-      if (sec && year) {
-        const isNewClass = !existingClasses.some(c => c.department === dName && c.section === sec && c.academicYear === year);
+      // If a section isn't given but a year is, default the section to "A"
+      // rather than silently skipping class creation for that row.
+      const finalSec = sec || 'A';
+
+      if (year) {
+        const isNewClass = !existingClasses.some(c => c.department === dName && c.section === finalSec && c.academicYear === year);
         // Avoid duplicate pushes in preview
-        if (!deptsMap[dName].classes.some(c => c.section === sec && c.academicYear === year)) {
-          deptsMap[dName].classes.push({ section: sec, academicYear: year, isNew: isNewClass });
+        if (!deptsMap[dName].classes.some(c => c.section === finalSec && c.academicYear === year)) {
+          deptsMap[dName].classes.push({ section: finalSec, academicYear: year, isNew: isNewClass });
         }
       }
     }
@@ -498,14 +534,33 @@ const bulkDepts = async (req, res, next) => {
 const parseStudents = async (req, res, next) => {
   try {
     if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
+
+    // classId is OPTIONAL and means two different things depending on caller:
+    // - Present (Manage Classes -> a class -> Import): every row goes into
+    //   that one class; the file itself doesn't need Department/Section/Year
+    //   columns at all.
+    // - Absent (Manage Students -> Bulk Import): this is a flat, cross-
+    //   department import — each row must carry its own Department/Section/
+    //   Year of Study, and that class must already exist.
     const { classId } = req.body;
-    if (!classId) return res.status(400).json({ success: false, message: 'classId is required' });
+
+    let scopedClass = null;
+    if (classId) {
+      scopedClass = await ClassSection.findById(classId);
+      if (!scopedClass) {
+        return res.status(404).json({ success: false, message: 'Class not found.' });
+      }
+    }
 
     const data = parseFile(req.file);
     const preview = [];
 
     const emailsInDB = (await User.find({}, 'email')).map(u => u.email);
     const regsInDB = (await User.find({ registrationNumber: { $ne: null } }, 'registrationNumber')).map(u => u.registrationNumber);
+
+    // Only needed for the flat cross-department path, to confirm each row's
+    // Department/Section/Year actually matches an existing class.
+    const existingClasses = scopedClass ? [] : await ClassSection.find();
 
     for (const row of data) {
       let name = (row['Name'] || row['name'] || '').toString().trim();
@@ -525,8 +580,32 @@ const parseStudents = async (req, res, next) => {
 
       if (!pass) errors.push('Temp Password missing');
 
+      let department, section, academicYear;
+
+      if (scopedClass) {
+        department = scopedClass.department;
+        section = scopedClass.section;
+        academicYear = scopedClass.academicYear;
+      } else {
+        department = (row['Department'] || row['department'] || '').toString().trim().toUpperCase();
+        section = (row['Section'] || row['section'] || '').toString().trim().toUpperCase();
+        academicYear = readYearColumn(row);
+
+        if (!department || !section || !academicYear) {
+          errors.push('Department, Section, and Year of Study are required');
+        } else {
+          const classExists = existingClasses.some(
+            (c) => c.department === department && c.section === section && c.academicYear === academicYear
+          );
+          if (!classExists) {
+            errors.push(`No class exists for ${department} - ${section} (Year of Study: ${academicYear})`);
+          }
+        }
+      }
+
       preview.push({
         name, email, registrationNumber: regNo, mobileNumber: mobile, password: pass,
+        department, section, academicYear,
         isValid: errors.length === 0,
         errors
       });
@@ -541,8 +620,15 @@ const parseStudents = async (req, res, next) => {
 const bulkStudents = async (req, res, next) => {
   try {
     const { preview, classId } = req.body;
-    const classSection = await ClassSection.findById(classId);
-    if (!classSection) return res.status(404).json({ success: false, message: 'Class not found' });
+
+    // Same optional-classId split as parseStudents: present means every row
+    // goes into that one class; absent means each row already carries its
+    // own (already-validated) Department/Section/Year of Study.
+    let scopedClass = null;
+    if (classId) {
+      scopedClass = await ClassSection.findById(classId);
+      if (!scopedClass) return res.status(404).json({ success: false, message: 'Class not found' });
+    }
 
     let createdCount = 0;
 
@@ -556,9 +642,9 @@ const bulkStudents = async (req, res, next) => {
             role: 'student',
             registrationNumber: row.registrationNumber,
             mobileNumber: row.mobileNumber,
-            class: classSection.department,
-            section: classSection.section,
-            academicYear: classSection.academicYear,
+            class: scopedClass ? scopedClass.department : row.department,
+            section: scopedClass ? scopedClass.section : row.section,
+            academicYear: scopedClass ? scopedClass.academicYear : row.academicYear,
             profileCompleted: false
           });
           createdCount++;
@@ -592,23 +678,27 @@ const parseCombined = async (req, res, next) => {
     for (const row of data) {
       let dName = (row['Department'] || row['department'] || '').toString().trim().toUpperCase();
       let sec = (row['Section'] || row['section'] || '').toString().trim().toUpperCase();
-      let year = (row['Academic Year'] || row['academicYear'] || row['Year'] || '').toString().trim();
+      let year = readYearColumn(row);
       let name = (row['Name'] || row['name'] || '').toString().trim();
       let email = (row['College Email'] || row['Email'] || row['email'] || '').toString().trim().toLowerCase();
       let regNo = (row['Registration Number'] || row['Registration'] || row['regNo'] || '').toString().trim().toUpperCase();
       let mobile = (row['Mobile Number'] || row['Mobile'] || row['mobile'] || '').toString().trim();
       let pass = (row['Temporary Password'] || row['Password'] || row['password'] || '').toString().trim();
 
+      // If a row gives a department + year but no section, default the
+      // section to "A" rather than dropping the class entirely.
+      const finalSec = sec || 'A';
+
       // Validation for Dept & Class
       if (dName) {
         if (!previewDepartments[dName]) {
           previewDepartments[dName] = { name: dName, isNew: !existingDepts.some(d => d.name === dName) };
         }
-        if (sec && year) {
-          const classKey = `${dName}-${sec}-${year}`;
+        if (year) {
+          const classKey = `${dName}-${finalSec}-${year}`;
           if (!previewClasses.some(c => c.key === classKey)) {
-            const isNewClass = !existingClasses.some(c => c.department === dName && c.section === sec && c.academicYear === year);
-            previewClasses.push({ key: classKey, department: dName, section: sec, academicYear: year, isNew: isNewClass });
+            const isNewClass = !existingClasses.some(c => c.department === dName && c.section === finalSec && c.academicYear === year);
+            previewClasses.push({ key: classKey, department: dName, section: finalSec, academicYear: year, isNew: isNewClass });
           }
         }
       }
@@ -625,11 +715,11 @@ const parseCombined = async (req, res, next) => {
         else if (regsInDB.includes(regNo)) errors.push('Reg Number already exists');
 
         if (!pass) errors.push('Temp Password missing');
-        if (!dName || !sec || !year) errors.push('Missing department/section/year for this student');
+        if (!dName || !year) errors.push('Missing department or year of study for this student');
 
         previewStudents.push({
           name, email, registrationNumber: regNo, mobileNumber: mobile, password: pass,
-          department: dName, section: sec, academicYear: year,
+          department: dName, section: finalSec, academicYear: year,
           isValid: errors.length === 0,
           errors
         });
