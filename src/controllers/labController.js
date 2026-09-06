@@ -9,14 +9,14 @@ const { getLabProgress } = require('../services/progressService');
 /**
  * GET /api/labs
  * - Faculty/Admin: all labs they created or all labs
- * - Student: only labs assigned to their class/section/regNo
+ * - Student: only PUBLISHED labs assigned to their class/section
  */
 const getLabs = async (req, res, next) => {
   try {
     let query = {};
 
     if (req.user.role === 'faculty') {
-      query.createdBy = req.user._id; // Changed to ._id just in case .id is undefined or not working as expected
+      query.createdBy = req.user._id;
       console.log(`[DEBUG] getLabs (faculty) -> querying with createdBy: ${req.user._id}`);
     } else if (req.user.role === 'student') {
       // A student with no class/section assigned yet must see NO labs,
@@ -26,24 +26,29 @@ const getLabs = async (req, res, next) => {
       }
       query = {
         isActive: true,
+        isPublished: true, // students only ever see published labs
         class: req.user.class.toUpperCase(),
         section: req.user.section.toUpperCase(),
       };
     }
-    // Admin sees all
+    // Admin sees all (including drafts)
 
     const labs = await Lab.find(query)
       .populate('createdBy', 'name email')
       .sort({ createdAt: -1 });
     console.log(`[DEBUG] getLabs -> found ${labs.length} labs`);
 
-    // For students, no regNo filtering anymore, query already filters by class/section
     let filteredLabs = labs;
 
     // Attach experiment count and progress
     const labsWithCount = await Promise.all(
       filteredLabs.map(async (lab) => {
-        const count = await WeeklyExperiment.countDocuments({ lab: lab._id, isActive: true });
+        // Students only ever count published experiments toward totals
+        const expQuery = { lab: lab._id, isActive: true };
+        if (req.user.role === 'student') {
+          expQuery.isPublished = true;
+        }
+        const count = await WeeklyExperiment.countDocuments(expQuery);
 
         let progressData = {};
 
@@ -51,7 +56,6 @@ const getLabs = async (req, res, next) => {
           const progress = await getLabProgress(req.user._id, lab._id);
           progressData = { ...progress };
         } else if (req.user.role === 'faculty' || req.user.role === 'admin') {
-          // Calculate Assigned Students
           const allStudentsInClass = await User.find({
             role: 'student',
             class: lab.class,
@@ -60,19 +64,15 @@ const getLabs = async (req, res, next) => {
           }).select('registrationNumber');
 
           const assignedStudents = allStudentsInClass.map(s => s._id);
-
           const assignedCount = assignedStudents.length;
 
-          // Submitted students = students in assignedStudents who have an ExperimentSubmission for this lab
           const submittedStudentsCount = await ExperimentSubmission.distinct('student', {
             lab: lab._id,
             student: { $in: assignedStudents }
           });
 
-          // Completed students = students in assignedStudents who have evaluated final submissions for ALL experiments
           let completedCount = 0;
           if (count > 0 && assignedCount > 0) {
-            // Count students who have 'count' number of evaluated ExperimentSubmissions for this lab
             const studentCompletionAgg = await ExperimentSubmission.aggregate([
               { $match: { lab: lab._id, student: { $in: assignedStudents }, status: 'evaluated' } },
               { $group: { _id: '$student', evaluatedCount: { $sum: 1 } } },
@@ -108,7 +108,9 @@ const getLabs = async (req, res, next) => {
 
 /**
  * POST /api/labs
- * Faculty creates a new lab
+ * Faculty creates a new lab. Always starts as a draft (isPublished: false)
+ * regardless of what's sent in the body, so students never see a lab
+ * before faculty explicitly publishes it.
  */
 const createLab = async (req, res, next) => {
   try {
@@ -129,6 +131,7 @@ const createLab = async (req, res, next) => {
       section,
       academicYear,
       createdBy: req.user._id,
+      isPublished: false, // always starts as draft
     });
 
     console.log(`[DEBUG] createLab -> saved lab ${lab._id} with createdBy: ${lab.createdBy}`);
@@ -147,7 +150,8 @@ const createLab = async (req, res, next) => {
 
 /**
  * GET /api/labs/:id
- * Get a single lab with its experiments
+ * Get a single lab with its experiments.
+ * Students only see published experiments within the lab.
  */
 const getLabById = async (req, res, next) => {
   try {
@@ -157,8 +161,17 @@ const getLabById = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Lab not found.' });
     }
 
-    const experiments = await WeeklyExperiment.find({ lab: lab._id, isActive: true })
-      .sort({ weekNumber: 1 });
+    // A student should not be able to view an unpublished lab at all
+    if (req.user && req.user.role === 'student' && !lab.isPublished) {
+      return res.status(404).json({ success: false, message: 'Lab not found.' });
+    }
+
+    const expQuery = { lab: lab._id, isActive: true };
+    if (req.user && req.user.role === 'student') {
+      expQuery.isPublished = true;
+    }
+
+    const experiments = await WeeklyExperiment.find(expQuery).sort({ weekNumber: 1 });
 
     const experimentsWithCount = await Promise.all(
       experiments.map(async (exp) => {
@@ -191,7 +204,10 @@ const getLabById = async (req, res, next) => {
 
 /**
  * PUT /api/labs/:id
- * Faculty updates a lab
+ * Faculty updates a lab (title, description, questions, etc. via nested
+ * routes). isPublished is intentionally NOT settable here — publishing
+ * only happens through the dedicated publishLab endpoint below, so it's
+ * a deliberate action, not a side-effect of an unrelated edit.
  */
 const updateLab = async (req, res, next) => {
   try {
@@ -205,12 +221,48 @@ const updateLab = async (req, res, next) => {
       return res.status(403).json({ success: false, message: 'Not authorized to update this lab.' });
     }
 
-    const updated = await Lab.findByIdAndUpdate(req.params.id, req.body, {
+    // Strip isPublished/publishedAt from arbitrary updates
+    const { isPublished, publishedAt, ...safeUpdates } = req.body;
+
+    const updated = await Lab.findByIdAndUpdate(req.params.id, safeUpdates, {
       new: true,
       runValidators: true,
     }).populate('createdBy', 'name email');
 
     res.json({ success: true, message: 'Lab updated.', data: { lab: updated } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * PATCH /api/labs/:id/publish
+ * Faculty explicitly publishes a lab, making it visible to students.
+ * Body: { publish: true } to publish, { publish: false } to unpublish/revert to draft.
+ */
+const publishLab = async (req, res, next) => {
+  try {
+    const lab = await Lab.findById(req.params.id);
+
+    if (!lab) {
+      return res.status(404).json({ success: false, message: 'Lab not found.' });
+    }
+
+    if (lab.createdBy.toString() !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ success: false, message: 'Not authorized to publish this lab.' });
+    }
+
+    const shouldPublish = req.body.publish !== false; // default true
+
+    lab.isPublished = shouldPublish;
+    lab.publishedAt = shouldPublish ? new Date() : undefined;
+    await lab.save();
+
+    res.json({
+      success: true,
+      message: shouldPublish ? 'Lab published successfully.' : 'Lab reverted to draft.',
+      data: { lab },
+    });
   } catch (error) {
     next(error);
   }
@@ -234,7 +286,6 @@ const deleteLab = async (req, res, next) => {
 
     await Lab.findByIdAndDelete(req.params.id);
 
-    // Cascading delete
     await WeeklyExperiment.deleteMany({ lab: req.params.id });
     await Problem.deleteMany({ lab: req.params.id });
     const Submission = require('../models/Submission');
@@ -247,4 +298,4 @@ const deleteLab = async (req, res, next) => {
   }
 };
 
-module.exports = { getLabs, createLab, getLabById, updateLab, deleteLab };
+module.exports = { getLabs, createLab, getLabById, updateLab, publishLab, deleteLab };

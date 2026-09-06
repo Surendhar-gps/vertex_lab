@@ -7,13 +7,20 @@ const { evaluateSubmission } = require('../services/evaluation/evaluationService
 
 /**
  * GET /api/labs/:labId/experiments
+ * Students only see published experiments; faculty/admin see all.
  */
 const getExperimentsByLab = async (req, res, next) => {
   try {
-    const experiments = await WeeklyExperiment.find({
+    const query = {
       lab: req.params.labId,
       isActive: true,
-    })
+    };
+
+    if (req.user && req.user.role === 'student') {
+      query.isPublished = true;
+    }
+
+    const experiments = await WeeklyExperiment.find(query)
       .populate('createdBy', 'name email')
       .sort({ weekNumber: 1 });
 
@@ -38,6 +45,8 @@ const getExperimentsByLab = async (req, res, next) => {
 
 /**
  * POST /api/labs/:labId/experiments
+ * Always starts as a draft (isPublished: false) so faculty can add/edit
+ * questions before students ever see it.
  */
 const createExperiment = async (req, res, next) => {
   try {
@@ -62,6 +71,7 @@ const createExperiment = async (req, res, next) => {
       description,
       instructions,
       createdBy: req.user.id || req.user._id,
+      isPublished: false, // always starts as draft
     };
     if (dueDate) {
       experimentData.dueDate = dueDate;
@@ -93,6 +103,11 @@ const getExperimentById = async (req, res, next) => {
       .populate('lab', 'title topic');
 
     if (!experiment) {
+      return res.status(404).json({ success: false, message: 'Experiment not found.' });
+    }
+
+    // A student should not be able to view an unpublished experiment at all
+    if (req.user && req.user.role === 'student' && !experiment.isPublished) {
       return res.status(404).json({ success: false, message: 'Experiment not found.' });
     }
 
@@ -145,6 +160,11 @@ const submitSection = async (req, res, next) => {
       return res.status(404).json({ success: false, message: 'Experiment not found.' });
     }
 
+    // Students cannot submit to an unpublished experiment
+    if (!experiment.isPublished) {
+      return res.status(404).json({ success: false, message: 'Experiment not found.' });
+    }
+
     // Get or create ExperimentSubmission
     let finalSubmission = await ExperimentSubmission.findOne({
       weeklyExperiment: experimentId,
@@ -186,11 +206,10 @@ const submitSection = async (req, res, next) => {
         return res.status(400).json({ success: false, message: 'Answers payload is required for MCQ submission.' });
       }
 
-      // Check if all active questions are answered
       const activeIds = sectionQuestions.map(q => q._id.toString());
       const answeredIds = Object.keys(answers);
       const allAnswered = activeIds.every(id => answeredIds.includes(id));
-      
+
       if (!allAnswered) {
         const missing = sectionQuestions.filter(q => !answeredIds.includes(q._id.toString()));
         return res.status(400).json({
@@ -202,13 +221,11 @@ const submitSection = async (req, res, next) => {
       let sectionAutoScore = 0;
       let sectionMaxScore = 0;
 
-      // Process each answer
       for (const q of sectionQuestions) {
         const studentAnswerIndex = answers[q._id.toString()];
         const isCorrect = studentAnswerIndex === q.mcqCorrectAnswer;
         const score = isCorrect ? q.marks : 0;
-        
-        // Upsert Submission
+
         await Submission.findOneAndUpdate(
           { student: studentId, problem: q._id, weeklyExperiment: experimentId },
           {
@@ -228,7 +245,6 @@ const submitSection = async (req, res, next) => {
       }
 
       finalSubmission.mcqStatus = 'evaluated';
-      // Accumulate to total
       finalSubmission.totalAutoScore = (finalSubmission.totalAutoScore || 0) + sectionAutoScore;
       finalSubmission.totalFinalScore = (finalSubmission.totalFinalScore || 0) + sectionAutoScore;
       finalSubmission.totalMaxScore = (finalSubmission.totalMaxScore || 0) + sectionMaxScore;
@@ -242,7 +258,6 @@ const submitSection = async (req, res, next) => {
     }
 
     // Handle CAD evaluation asynchronously (Skill Enhancer / Practice)
-    // Validate that all questions for THIS section are answered via file uploads
     const submissions = await Submission.find({
       weeklyExperiment: experimentId,
       student: studentId,
@@ -250,7 +265,7 @@ const submitSection = async (req, res, next) => {
 
     const sectionSubmissions = submissions.filter(s => s.problem && s.problem.type === section);
     const submittedProblemIds = new Set(sectionSubmissions.map((s) => s.problem._id.toString()));
-    
+
     const allUploaded = sectionQuestions.every((q) => submittedProblemIds.has(q._id.toString()));
     if (!allUploaded) {
       const missing = sectionQuestions.filter((q) => !submittedProblemIds.has(q._id.toString()));
@@ -260,7 +275,6 @@ const submitSection = async (req, res, next) => {
       });
     }
 
-    // Handle CAD evaluation asynchronously
     finalSubmission[statusField] = 'evaluating';
     await finalSubmission.save();
 
@@ -275,8 +289,6 @@ const submitSection = async (req, res, next) => {
         try {
           const updatedFinalSub = await ExperimentSubmission.findById(finalSubmission._id);
           updatedFinalSub[statusField] = 'evaluated';
-          
-          // We can optionally recalculate totals here if needed, but existing logic does it per submission or on the fly
           await updatedFinalSub.save();
         } catch (err) {
           console.error('[FinalSubmit] Error updating experiment submission status:', err.message);
@@ -314,7 +326,7 @@ const getExperimentProgress = async (req, res, next) => {
 
     let finalSubmission = null;
     let completedSectionsCount = 0;
-    
+
     if (req.user.role === 'student') {
       finalSubmission = await ExperimentSubmission.findOne({
         weeklyExperiment: experimentId,
@@ -327,8 +339,6 @@ const getExperimentProgress = async (req, res, next) => {
       }
     }
 
-    // There are 3 sections, so we calculate progress out of 3.
-    // The requirement explicitly states "EVERY WEEKLY EXPERIMENT MUST HAVE ALL 3 SECTIONS"
     const totalSections = 3;
     const progress = totalSections > 0 ? Math.round((completedSectionsCount / totalSections) * 100) : 0;
 
@@ -350,6 +360,8 @@ const getExperimentProgress = async (req, res, next) => {
 
 /**
  * PUT /api/experiments/:id
+ * isPublished is intentionally excluded from generic updates — publishing
+ * happens only through the dedicated publishExperiment endpoint.
  */
 const updateExperiment = async (req, res, next) => {
   try {
@@ -360,11 +372,69 @@ const updateExperiment = async (req, res, next) => {
     if (experiment.createdBy.toString() !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({ success: false, message: 'Not authorized.' });
     }
-    const updated = await WeeklyExperiment.findByIdAndUpdate(req.params.id, req.body, {
+
+    const { isPublished, publishedAt, ...safeUpdates } = req.body;
+
+    const updated = await WeeklyExperiment.findByIdAndUpdate(req.params.id, safeUpdates, {
       new: true,
       runValidators: true,
     });
     res.json({ success: true, message: 'Experiment updated.', data: { experiment: updated } });
+  } catch (error) {
+    next(error);
+  }
+};
+
+/**
+ * PATCH /api/experiments/:id/publish
+ * Faculty explicitly publishes a weekly experiment so students can see it.
+ * Body: { publish: true } to publish, { publish: false } to revert to draft.
+ *
+ * Before publishing (not before reverting to draft), every Skill Enhancer /
+ * Practice by Yourself question must have an answer key file uploaded.
+ * MCQ questions are exempt - they use mcqCorrectAnswer, which is already
+ * required at creation/import time.
+ */
+const publishExperiment = async (req, res, next) => {
+  try {
+    const experiment = await WeeklyExperiment.findById(req.params.id);
+    if (!experiment) {
+      return res.status(404).json({ success: false, message: 'Experiment not found.' });
+    }
+    if (experiment.createdBy.toString() !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({ success: false, message: 'Not authorized.' });
+    }
+
+    const shouldPublish = req.body.publish !== false; // default true
+
+    if (shouldPublish) {
+      const cadQuestions = await Problem.find({
+        weeklyExperiment: experiment._id,
+        isActive: true,
+        type: { $in: ['skill_enhancer', 'practice_by_yourself'] },
+      });
+
+      const missingAnswerKey = cadQuestions.filter((q) => !q.answerKeyFileUrl);
+
+      if (missingAnswerKey.length > 0) {
+        return res.status(400).json({
+          success: false,
+          message: `Cannot publish: the following question(s) are missing an answer key file - ${missingAnswerKey
+            .map((q) => `Q${q.questionNumber} (${q.title})`)
+            .join(', ')}.`,
+        });
+      }
+    }
+
+    experiment.isPublished = shouldPublish;
+    experiment.publishedAt = shouldPublish ? new Date() : undefined;
+    await experiment.save();
+
+    res.json({
+      success: true,
+      message: shouldPublish ? 'Experiment published successfully.' : 'Experiment reverted to draft.',
+      data: { experiment },
+    });
   } catch (error) {
     next(error);
   }
@@ -394,6 +464,7 @@ module.exports = {
   createExperiment,
   getExperimentById,
   updateExperiment,
+  publishExperiment,
   deleteExperiment,
   submitSection,
   getExperimentProgress,

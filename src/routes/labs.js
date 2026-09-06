@@ -1,5 +1,5 @@
 const express = require('express');
-const { getLabs, createLab, getLabById, updateLab, deleteLab } = require('../controllers/labController');
+const { getLabs, createLab, getLabById, updateLab, publishLab, deleteLab } = require('../controllers/labController');
 const {
   getExperimentsByLab,
   createExperiment,
@@ -15,6 +15,8 @@ router.get('/', getLabs);
 router.post('/', requireRole('faculty', 'admin'), createLab);
 router.get('/:id', getLabById);
 router.put('/:id', requireRole('faculty', 'admin'), updateLab);
+// Changed from PATCH to PUT to match the frontend's labService.publishLab (api.put) call.
+router.put('/:id/publish', requireRole('faculty', 'admin'), publishLab);
 router.delete('/:id', requireRole('faculty', 'admin'), deleteLab);
 
 // Nested experiments under labs

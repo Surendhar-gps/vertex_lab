@@ -6,6 +6,34 @@ const xlsx = require('xlsx');
 const papaparse = require('papaparse');
 
 /**
+ * ============================================================
+ * Section type configuration
+ *
+ * ASSUMPTION: adjust SECTION_TYPE_MAP's `type`/`format` values
+ * to match whatever enum strings your Problem model / frontend
+ * actually use for these three sections. I've used
+ * 'mcq' | 'skill_enhancer' | 'practice_yourself' since that's
+ * consistent with the existing hardcoded 'mcq' string, but you
+ * should confirm these match your Problem schema exactly before
+ * deploying, or bulk-created rows will silently mismatch what
+ * the rest of the app expects.
+ * ============================================================
+ */
+// CORRECTED to match FacultyExperimentDetail.jsx exactly:
+// type is 'practice_by_yourself' (not 'practice_yourself'), and format
+// is 'cad' for both non-MCQ types (matches derivedFormat in that file).
+const SECTION_TYPE_MAP = {
+  'mcq': { type: 'mcq', format: 'mcq' },
+  'skill enhancer': { type: 'skill_enhancer', format: 'cad' },
+  'practice by yourself': { type: 'practice_by_yourself', format: 'cad' }
+};
+
+const normalizeSectionType = (raw) => {
+  const key = (raw || '').toString().trim().toLowerCase();
+  return SECTION_TYPE_MAP[key] || null;
+};
+
+/**
  * POST /api/problems
  * Faculty creates a question
  */
@@ -237,12 +265,18 @@ const deleteProblem = async (req, res, next) => {
  * ============================================================
  * GET /api/problems/template
  *
- * Download the correct MCQ Excel template
+ * Download the bulk import template. Includes a "Section Type"
+ * column (required so parseQuestions/bulkQuestions can still
+ * route rows to MCQ / Skill Enhancer / Practice by Yourself),
+ * but the example data shows only an MCQ row - showing a sample
+ * row per type in the same sheet was confusing since the
+ * Option/Correct Option Index columns only apply to MCQ.
  * ============================================================
  */
 const downloadTemplate = async (req, res, next) => {
   try {
     const headers = [
+      'Section Type',
       'Title',
       'Description',
       'Instructions',
@@ -254,7 +288,8 @@ const downloadTemplate = async (req, res, next) => {
       'Correct Option Index'
     ];
 
-    const sampleRow = [
+    const mcqRow = [
+      'MCQ',
       'What is AutoCAD?',
       'Basic AutoCAD question',
       'Select the correct answer.',
@@ -268,11 +303,12 @@ const downloadTemplate = async (req, res, next) => {
 
     const worksheet = xlsx.utils.aoa_to_sheet([
       headers,
-      sampleRow
+      mcqRow
     ]);
 
     // Set useful column widths
     worksheet['!cols'] = [
+      { wch: 20 },
       { wch: 30 },
       { wch: 35 },
       { wch: 35 },
@@ -295,7 +331,7 @@ const downloadTemplate = async (req, res, next) => {
     xlsx.utils.book_append_sheet(
       workbook,
       worksheet,
-      'MCQ Questions'
+      'Bulk Questions'
     );
 
     const buffer = xlsx.write(workbook, {
@@ -310,7 +346,7 @@ const downloadTemplate = async (req, res, next) => {
 
     res.setHeader(
       'Content-Disposition',
-      'attachment; filename="MCQ_Bulk_Import_Template.xlsx"'
+      'attachment; filename="Bulk_Import_Template.xlsx"'
     );
 
     res.send(buffer);
@@ -324,19 +360,19 @@ const downloadTemplate = async (req, res, next) => {
  * ============================================================
  * POST /api/problems/parse
  *
- * Parses CSV/Excel file containing ONLY MCQ questions.
+ * Parses CSV/Excel file containing MCQ, Skill Enhancer, and/or
+ * Practice by Yourself questions, distinguished by the
+ * "Section Type" column.
  *
  * Expected columns:
  *
+ * Section Type   (MCQ | Skill Enhancer | Practice by Yourself)
  * Title
  * Description
  * Instructions
  * Marks
- * Option 1
- * Option 2
- * Option 3
- * Option 4
- * Correct Option Index
+ * Option 1..4          (MCQ rows only)
+ * Correct Option Index (MCQ rows only)
  * ============================================================
  */
 const parseQuestions = async (req, res, next) => {
@@ -390,6 +426,20 @@ const parseQuestions = async (req, res, next) => {
 
     for (const row of data) {
 
+      const errors = [];
+
+      const sectionTypeRaw = (row['Section Type'] || '')
+        .toString()
+        .trim();
+
+      const sectionType = normalizeSectionType(sectionTypeRaw);
+
+      if (!sectionType) {
+        errors.push(
+          `Section Type must be one of: MCQ, Skill Enhancer, Practice by Yourself (got "${sectionTypeRaw}")`
+        );
+      }
+
       const title = (row['Title'] || '')
         .toString()
         .trim();
@@ -402,68 +452,56 @@ const parseQuestions = async (req, res, next) => {
         .toString()
         .trim();
 
-      const marks = parseInt(row['Marks']) || 1;
-
-      const opt1 = (row['Option 1'] || '')
-        .toString()
-        .trim();
-
-      const opt2 = (row['Option 2'] || '')
-        .toString()
-        .trim();
-
-      const opt3 = (row['Option 3'] || '')
-        .toString()
-        .trim();
-
-      const opt4 = (row['Option 4'] || '')
-        .toString()
-        .trim();
-
-      const correctIdx = parseInt(
-        row['Correct Option Index']
-      );
-
-      const mcqOptions = [
-        { text: opt1 },
-        { text: opt2 },
-        { text: opt3 },
-        { text: opt4 }
-      ];
-
-      // Excel uses 1,2,3,4
-      // Database uses 0,1,2,3
-      let mcqCorrectAnswer = isNaN(correctIdx)
-        ? 0
-        : correctIdx - 1;
-
-      if (
-        mcqCorrectAnswer < 0 ||
-        mcqCorrectAnswer > 3
-      ) {
-        mcqCorrectAnswer = 0;
-      }
-
-      const errors = [];
+      const defaultMarks = sectionType && sectionType.type === 'mcq' ? 1 : 10;
+      const marks = parseInt(row['Marks']) || defaultMarks;
 
       if (!title) {
         errors.push('Title missing');
       }
 
-      if (!opt1 && !opt2 && !opt3 && !opt4) {
-        errors.push(
-          'MCQ requires options (Option 1, 2, 3, 4)'
-        );
-      }
+      let mcqOptions = [];
+      let mcqCorrectAnswer;
 
-      if (
-        isNaN(correctIdx) ||
-        correctIdx < 1 ||
-        correctIdx > 4
-      ) {
-        errors.push(
-          'Correct Option Index must be between 1 and 4'
-        );
+      if (!sectionType || sectionType.type === 'mcq') {
+        // MCQ rows (also used as the default validation path when
+        // Section Type failed to normalize, so a bad Section Type
+        // still surfaces one error rather than being silently skipped)
+        const opt1 = (row['Option 1'] || '').toString().trim();
+        const opt2 = (row['Option 2'] || '').toString().trim();
+        const opt3 = (row['Option 3'] || '').toString().trim();
+        const opt4 = (row['Option 4'] || '').toString().trim();
+
+        const correctIdx = parseInt(row['Correct Option Index']);
+
+        mcqOptions = [
+          { text: opt1 },
+          { text: opt2 },
+          { text: opt3 },
+          { text: opt4 }
+        ];
+
+        // Excel uses 1,2,3,4 - Database uses 0,1,2,3
+        mcqCorrectAnswer = isNaN(correctIdx) ? 0 : correctIdx - 1;
+
+        if (mcqCorrectAnswer < 0 || mcqCorrectAnswer > 3) {
+          mcqCorrectAnswer = 0;
+        }
+
+        if (!opt1 && !opt2 && !opt3 && !opt4) {
+          errors.push('MCQ requires options (Option 1, 2, 3, 4)');
+        }
+
+        if (isNaN(correctIdx) || correctIdx < 1 || correctIdx > 4) {
+          errors.push('Correct Option Index must be between 1 and 4');
+        }
+      } else {
+        // Skill Enhancer / Practice by Yourself rows: no options,
+        // no correct answer - instructions carry the requirement.
+        if (!instructions) {
+          errors.push(
+            `${sectionTypeRaw} requires Instructions`
+          );
+        }
       }
 
       preview.push({
@@ -471,8 +509,8 @@ const parseQuestions = async (req, res, next) => {
         description,
         instructions,
         marks,
-        type: 'mcq',
-        format: 'mcq',
+        type: sectionType ? sectionType.type : 'mcq',
+        format: sectionType ? sectionType.format : 'mcq',
         mcqOptions,
         mcqCorrectAnswer,
         isValid: errors.length === 0,
@@ -494,7 +532,10 @@ const parseQuestions = async (req, res, next) => {
  * ============================================================
  * POST /api/problems/bulk
  *
- * Creates MCQ questions only.
+ * Creates MCQ, Skill Enhancer, and Practice by Yourself
+ * questions from a previously-parsed preview array. Question
+ * numbering is tracked per-type, same as the rest of the app
+ * (see createProblem / deleteProblem / renumberQuestions).
  * ============================================================
  */
 const bulkQuestions = async (req, res, next) => {
@@ -506,6 +547,7 @@ const bulkQuestions = async (req, res, next) => {
     } = req.body;
 
     let createdCount = 0;
+    const createdByType = {};
 
     const experiment =
       await WeeklyExperiment.findById(
@@ -519,13 +561,23 @@ const bulkQuestions = async (req, res, next) => {
       });
     }
 
-    const existingCount =
-      await Problem.countDocuments({
-        weeklyExperiment: weeklyExperimentId,
-        type: 'mcq'
-      });
+    // Track the next question number separately per type, since
+    // question numbering is scoped by (weeklyExperiment, type)
+    // elsewhere in this file.
+    const nextQNumberByType = {};
 
-    let currentQNumber = existingCount + 1;
+    const getNextQNumber = async (type) => {
+      if (nextQNumberByType[type] == null) {
+        const existingCount = await Problem.countDocuments({
+          weeklyExperiment: weeklyExperimentId,
+          type
+        });
+        nextQNumberByType[type] = existingCount + 1;
+      }
+      const n = nextQNumberByType[type];
+      nextQNumberByType[type] = n + 1;
+      return n;
+    };
 
     const addedProblemIds = [];
 
@@ -534,32 +586,38 @@ const bulkQuestions = async (req, res, next) => {
       if (row.isValid) {
 
         try {
+          const rowType = row.type || 'mcq';
+          const rowFormat = row.format || rowType;
+          const questionNumber = await getNextQNumber(rowType);
 
-          const newProblem = await Problem.create({
+          const problemData = {
             weeklyExperiment: weeklyExperimentId,
             lab: labId,
-            questionNumber: currentQNumber++,
+            questionNumber,
             title: row.title,
             description: row.description,
             instructions: row.instructions,
-            marks: row.marks || 1,
-            format: 'mcq',
-            type: 'mcq',
-            mcqOptions: row.mcqOptions,
-            mcqCorrectAnswer:
-              row.mcqCorrectAnswer,
+            marks: row.marks || (rowType === 'mcq' ? 1 : 10),
+            format: rowFormat,
+            type: rowType,
             createdBy: req.user._id
-          });
+          };
 
-          addedProblemIds.push(
-            newProblem._id
-          );
+          if (rowType === 'mcq') {
+            problemData.mcqOptions = row.mcqOptions;
+            problemData.mcqCorrectAnswer = row.mcqCorrectAnswer;
+          }
+
+          const newProblem = await Problem.create(problemData);
+
+          addedProblemIds.push(newProblem._id);
 
           createdCount++;
+          createdByType[rowType] = (createdByType[rowType] || 0) + 1;
 
         } catch (e) {
           console.error(
-            'Bulk MCQ insert error:',
+            'Bulk question insert error:',
             e
           );
         }
@@ -579,10 +637,14 @@ const bulkQuestions = async (req, res, next) => {
       );
     }
 
+    const breakdown = Object.entries(createdByType)
+      .map(([type, count]) => `${count} ${type}`)
+      .join(', ');
+
     res.json({
       success: true,
       message:
-        `Added ${createdCount} MCQ question(s) successfully.`
+        `Added ${createdCount} question(s) successfully${breakdown ? ` (${breakdown})` : ''}.`
     });
 
   } catch (error) {

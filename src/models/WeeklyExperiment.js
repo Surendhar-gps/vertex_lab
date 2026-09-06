@@ -37,6 +37,16 @@ const weeklyExperimentSchema = new mongoose.Schema(
       type: Boolean,
       default: true,
     },
+    // Draft/Publish workflow: a weekly experiment starts as a draft so
+    // faculty can add/edit questions freely; students only see it once
+    // it's explicitly published.
+    isPublished: {
+      type: Boolean,
+      default: false,
+    },
+    publishedAt: {
+      type: Date,
+    },
   },
   {
     timestamps: true,
