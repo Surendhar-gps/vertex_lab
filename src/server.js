@@ -1,3 +1,6 @@
+const dns = require('dns');
+dns.setDefaultResultOrder('ipv4first');
+
 require('dotenv').config();
 console.log('EMAIL_USER loaded:', process.env.EMAIL_USER);
 console.log('EMAIL_PASS loaded:', process.env.EMAIL_PASS ? 'yes (hidden)' : 'undefined');
